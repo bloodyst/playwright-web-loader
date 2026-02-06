@@ -1,0 +1,25 @@
+limit_urls: 0
+concurrency: 4
+
+nav_timeout_ms: 45000
+total_timeout_ms: 60000
+
+max_retries: 3
+retry_backoff_base_sec: 2.0
+retry_jitter_sec: 0.7
+
+min_delay_sec: 2.0
+max_delay_sec: 4.0
+
+headless: true
+
+save_html_on_fail: true
+save_screenshot_on_fail: true
+
+out_dir: "out"
+
+proxies:
+  enabled: true
+  list:
+    - "example"
+  random_proxy_per_task: true
