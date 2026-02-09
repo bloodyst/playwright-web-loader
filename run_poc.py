@@ -10,8 +10,30 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PWTimeoutError
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Response, TimeoutError as PWTimeoutError
 
+import threading
+
+class ProxyRotator:
+    def __init__(self, proxies, pages_per_proxy=5):
+        self.proxies = proxies
+        self.pages_per_proxy = pages_per_proxy
+        self.proxy_index = 0
+        self.used = 0
+        self.lock = threading.Lock()
+
+    def get_proxy(self):
+        with self.lock:
+            if not self.proxies:
+                return None
+
+            if self.used >= self.pages_per_proxy:
+                self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+                self.used = 0
+
+            proxy = self.proxies[self.proxy_index]
+            self.used += 1
+            return proxy
 
 # -----------------------------
 # Helpers
@@ -40,27 +62,32 @@ def load_urls(path: str) -> List[str]:
     return urls
 
 
-def looks_like_block_or_challenge(html: str, final_url: str) -> Tuple[bool, str]:
+def looks_like_block_or_challenge(html: str, final_url: str, title: Optional[str]) -> Tuple[bool, str]:
     low = (html or "").lower()
     url_low = (final_url or "").lower()
+    title_low = (title or "").lower()
 
-    patterns = [
-        ("captcha", "contains 'captcha'"),
-        ("cloudflare", "contains 'cloudflare'"),
-        ("attention required", "contains 'attention required'"),
-        ("verify you are human", "contains 'verify you are human'"),
-        ("checking your browser", "contains 'checking your browser'"),
-        ("access denied", "contains 'access denied'"),
+    if any(x in url_low for x in ["/cdn-cgi/", "challenge-platform", "chk_jschl", "managed-challenge"]):
+        return True, "cloudflare challenge url (/cdn-cgi/...)"
+
+    if any(x in title_low for x in ["just a moment", "attention required", "checking your browser"]):
+        return True, f"cloudflare-like title: {title}"
+
+    strong_html_markers = [
+        "checking your browser",
+        "cf-chl-",
+        "challenge-platform",
+        "cloudflare ray id",
+        "attention required",
     ]
-    for needle, why in patterns:
+    for needle in strong_html_markers:
         if needle in low:
-            return True, why
+            if len(low) < 20000:
+                return True, f"cloudflare marker: {needle}"
+            return False, ""
 
-    if any(x in url_low for x in ["captcha", "challenge", "blocked", "verify"]):
-        return True, "final url looks like a challenge/captcha"
-
-    if len(low) < 1500:
-        return True, "html too short (possible interstitial or load failure)"
+    if len(low) < 1500 and not title_low:
+        return True, "html very short and empty title"
 
     return False, ""
 
@@ -181,12 +208,33 @@ class BrowserPool:
 # Loading logic
 # -----------------------------
 
-async def new_context(browser: Browser) -> BrowserContext:
-    return await browser.new_context(
-        viewport={"width": 1366, "height": 768},
-        extra_http_headers=default_headers(),
-        locale="en-US",
-    )
+async def new_context(cfg: Dict[str, Any], browser: Browser) -> BrowserContext:
+    kwargs: Dict[str, Any] = {
+        "viewport": {"width": 1366, "height": 768},
+        "extra_http_headers": default_headers(),
+        "locale": str(cfg.get("locale", "en-US")),
+    }
+    ua = cfg.get("user_agent")
+    if ua:
+        kwargs["user_agent"] = str(ua)
+    tz = cfg.get("timezone_id")
+    if tz:
+        kwargs["timezone_id"] = str(tz)
+    return await browser.new_context(**kwargs)
+
+
+async def maybe_wait_for_soft_challenge(cfg: Dict[str, Any], page: Page, reason: str) -> None:
+    """If we hit a non-interactive 'Checking your browser' style page, optionally wait a bit and re-check.
+    This does NOT attempt to solve interactive challenges/captchas; it only waits for automatic redirects."""
+    if not cfg.get("challenge_wait_enabled", True):
+        return
+    reason_low = (reason or "").lower()
+    if ("checking your browser" not in reason_low) and ("just a moment" not in reason_low) and ("verify you are human" not in reason_low):
+        return
+    wait_sec = float(cfg.get("challenge_wait_sec", 8.0))
+    if wait_sec <= 0:
+        return
+    await asyncio.sleep(wait_sec)
 
 
 async def fetch_once(
@@ -199,6 +247,12 @@ async def fetch_once(
 ) -> LoadResult:
     t0 = time.time()
     ts = utc_iso()
+    print(
+        f"\n[FETCH] "
+        f"url={url} | "
+        f"attempt={attempt} | "
+        f"proxy={proxy_url}"
+    )
 
     html_path = None
     shot_path = None
@@ -217,7 +271,7 @@ async def fetch_once(
     page: Optional[Page] = None
 
     try:
-        context = await new_context(browser)
+        context = await new_context(cfg, browser)
         page = await context.new_page()
 
         async def _do():
@@ -225,21 +279,31 @@ async def fetch_once(
 
             resp: Optional[Response] = await page.goto(
                 url,
-                wait_until="domcontentloaded",
+                wait_until=str(cfg.get("wait_until", "domcontentloaded")),
                 timeout=nav_timeout,
             )
             if resp is not None:
                 http_status = resp.status
 
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(float(cfg.get('post_nav_delay_sec', 0.4)))
 
             final_url = page.url
             title = await page.title()
             html = await page.content()
 
-            suspected, why = looks_like_block_or_challenge(html, final_url)
+            suspected, why = looks_like_block_or_challenge(html, final_url, title)
             if suspected:
                 block_reason = why
+                await maybe_wait_for_soft_challenge(cfg, page, why)
+                final_url = page.url
+                title = await page.title()
+                html = await page.content()
+                suspected2, why2 = looks_like_block_or_challenge(html, final_url, title)
+                if not suspected2:
+                    block_reason = None
+                    suspected = False
+                else:
+                    block_reason = why2
 
             if (not resp) or (http_status and http_status >= 400) or suspected:
                 safe_id = slugify(url)
@@ -256,6 +320,14 @@ async def fetch_once(
 
             ok = (not suspected) and (http_status is None or http_status < 400)
             status = "OK" if ok else ("BLOCK_SUSPECTED" if suspected else "FAIL")
+            print(
+                f"[RESULT] "
+                f"url={url} | "
+                f"attempt={attempt} | "
+                f"proxy={proxy_url} | "
+                f"status={status} | "
+                f"http={http_status}"
+            )
             return html, ok, status
 
         try:
@@ -314,17 +386,16 @@ async def fetch_with_retries(
     pool: BrowserPool,
     url: str,
     out_dir: Path,
-    _proxy_url_unused: Optional[str] = None,
+    proxy_url: Optional[str],
 ) -> LoadResult:
     max_retries = int(cfg.get("max_retries", 3))
     base = float(cfg.get("retry_backoff_base_sec", 2.0))
     jitter = float(cfg.get("retry_jitter_sec", 0.7))
 
     last: Optional[LoadResult] = None
+
     for attempt in range(1, max_retries + 1):
         await polite_delay(cfg)
-
-        proxy_url = choose_proxy_for_task(cfg)
 
         res = await fetch_once(cfg, pool, url, attempt, out_dir, proxy_url)
         last = res
@@ -335,17 +406,6 @@ async def fetch_with_retries(
         await asyncio.sleep(min(sleep_s, 30.0))
 
     return last
-
-
-def choose_proxy_for_task(cfg: Dict[str, Any]) -> Optional[str]:
-    proxies_cfg = cfg.get("proxies", {}) or {}
-    if not proxies_cfg.get("enabled", False):
-        return None
-    lst = proxies_cfg.get("list", []) or []
-    if not lst:
-        return None
-    return random.choice(lst) if proxies_cfg.get("random_proxy_per_task", True) else lst[0]
-
 
 # -----------------------------
 # Reporting
@@ -378,6 +438,15 @@ async def main():
     ensure_dir(out_dir / "html")
     ensure_dir(out_dir / "screens")
 
+    proxies_cfg = cfg.get("proxies", {}) or {}
+
+    rotator = None
+    if proxies_cfg.get("enabled", False):
+        rotator = ProxyRotator(
+            proxies=proxies_cfg.get("list", []),
+            pages_per_proxy=int(proxies_cfg.get("pages_per_proxy", 5)),
+        )
+
     urls = load_urls("urls.txt")
     limit = int(cfg.get("limit_urls", 0))
     if limit > 0:
@@ -391,7 +460,7 @@ async def main():
 
         async def worker(u: str) -> None:
             async with sem:
-                proxy = choose_proxy_for_task(cfg)
+                proxy = rotator.get_proxy() if rotator else None
                 res = await fetch_with_retries(cfg, pool, u, out_dir, proxy)
                 results.append(res)
                 print(f"[{res.status}] {u} ({res.load_ms}ms) proxy={res.proxy}")
